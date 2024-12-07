@@ -5,6 +5,8 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "stdbool.h"
+#include "stdlib.h"
 
 // Struct to keep VM registers (Sample; feel free to change.)
 struct vm_reg {
@@ -72,35 +74,205 @@ struct vm_virtual_state {
     struct vm_reg mtinst;
     struct vm_reg mtval2;
 
-    bool pmp_enbaled;
-    struct vm_reg pmpcgf[16];
-    struct vm_reg pmpaddr[64];
+    int pmp;
+    struct vm_reg pmpcgf;
+    struct vm_reg pmpaddr;
     uint64 curr_mode;
-
-    pagetable_t pseudo_pt;
-    pagetable_t main_pt;
 };
 
 struct vm_virtual_state vm_state;
 
-// In your ECALL, add the following for prints
-// struct proc* p = myproc();
-// printf("(EC at %p)\n", p->trapframe->epc);
+struct vm_reg find_reg(unsigned int uimm) {
+    static struct vm_virtual_state v;
+
+    if(uimm == 0x000)
+        return v.ustatus;
+    else if (uimm == 0x004)
+        return v.uie;
+    else if (uimm == 0x040)
+        return v.uscratch;
+    else if (uimm == 0x100)
+        return v.sstatus;
+    else if (uimm == 0x102)
+        return v.sedeleg;
+    else if (uimm == 0x103)
+        return v.sideleg;
+    else if (uimm == 0x104)
+        return v.sie;
+    else if (uimm == 0x105)
+        return v.stvec;
+    else if (uimm == 0x106)
+        return v.scounteren;
+    else if (uimm == 0x140)
+        return v.sscratch;
+    else if (uimm == 0x141)
+        return v.sepc;
+    else if (uimm == 0x142)
+        return v.scause;
+    else if (uimm == 0x143)
+        return v.stval;
+    else if (uimm == 0x144)
+        return v.sip;
+    else if (uimm == 0x180)
+        return v.satp;
+    else if (uimm == 0xF11)
+        return v.mvendorid;
+    else if (uimm == 0xF12)
+        return v.marchid;
+    else if (uimm == 0xF13)
+        return v.mimpid;
+    else if (uimm == 0xF14)
+        return v.mhartid;
+    else if (uimm == 0x300)
+        return v.mstatus;
+    else if (uimm == 0x301)
+        return v.misa;
+    else if (uimm == 0x302)
+        return v.medeleg;
+    else if (uimm == 0x303)
+        return v.mideleg;
+    else if (uimm == 0x304)
+        return v.mie;
+    else if (uimm == 0x305)
+        return v.mtvec;
+    else if (uimm == 0x306)
+        return v.mcounteren;
+    else if (uimm == 0x310)
+        return v.mstatush;
+    else if (uimm == 0x340)
+        return v.mscratch;
+    else if (uimm == 0x341)
+        return v.mepc;
+    else if (uimm == 0x342)
+        return v.mcause;
+    else if (uimm == 0x343)
+        return v.mtval;
+    else if (uimm == 0x344)
+        return v.mip;
+    else if (uimm == 0x34A)
+        return v.mtinst;
+    else if (uimm == 0x34B)
+        return v.mtval2;
+    else if (uimm == 0x3A0)
+        return v.pmpcgf;
+    else if (uimm == 0x3B0)
+        return v.pmpaddr;
+    else {
+        struct vm_reg tmp;
+        tmp.val = -1;
+        return tmp;
+    }
+};
 
 void trap_and_emulate(void) {
     /* Comes here when a VM tries to execute a supervisor instruction. */
+    struct proc *p = myproc();
 
     /* Retrieve all required values from the instruction */
-    uint64 addr     = 0;
-    uint32 op       = 0;
-    uint32 rd       = 0;
-    uint32 funct3   = 0;
-    uint32 rs1      = 0;
-    uint32 uimm     = 0;
+    uint64 addr    = r_sepc();
+    char *pa = kalloc();
+    copyin(p->pagetable, pa, addr, PGSIZE);
+    uint32 inst     = *(uint32*)pa;
+    uint32 op       = inst & 0x7F;
+    uint32 rd       = (inst >> 7) & 0x1F;
+    uint32 funct3   = (inst >> 12) & 0x7;
+    uint32 rs1      = (inst >> 15) & 0x1F;
+    uint32 uimm     = (inst >> 20) & 0xFFF;
 
-    /* Print the statement */
-    printf("(PI at %p) op = %x, rd = %x, funct3 = %x, rs1 = %x, uimm = %x\n", 
+    if(funct3 == 0x0) {
+        if(uimm == 0x0) {
+            // ECALL
+            printf("ECALL (PI at %p) op = %x, rd = %x, funct3 = %x, rs1 = %x, uimm = %x\n", 
                 addr, op, rd, funct3, rs1, uimm);
+            printf("(EC at %p)\n", p->trapframe->epc);
+
+            if(vm_state.curr_mode == 0) {
+                vm_state.curr_mode = 1;
+                vm_state.sepc.val = p->trapframe->epc;
+                p->trapframe->epc = vm_state.stvec.val;
+            } 
+            else if(vm_state.curr_mode == 1) {
+                vm_state.mepc.val = p->trapframe->epc;
+                vm_state.curr_mode = 2;
+                p->trapframe->epc = vm_state.mtvec.val;
+            }
+        } 
+        else if(uimm == 0x102) {
+            // SRET
+            if (vm_state.curr_mode > 0) {
+                printf("SRET (PI at %p) op = %x, rd = %x, funct3 = %x, rs1 = %x, uimm = %x\n", 
+                    addr, op, rd, funct3, rs1, uimm);
+
+                p->trapframe->epc = vm_state.sepc.val;
+                vm_state.curr_mode = (vm_state.sstatus.val >> 8) & 0x1;
+            }
+            else {
+                setkilled(p);
+                trap_and_emulate_init();
+            }
+        }
+        else if(uimm == 0x302) {
+            // MRET
+            if (vm_state.curr_mode > 1) {
+                printf("MRET (PI at %p) op = %x, rd = %x, funct3 = %x, rs1 = %x, uimm = %x\n", 
+                    addr, op, rd, funct3, rs1, uimm);
+
+                vm_state.curr_mode = (vm_state.mstatus.val >> 11) & 0x3;;
+                p->trapframe->epc = vm_state.mepc.val;
+            }
+            else {
+                setkilled(p);
+                trap_and_emulate_init();
+            }
+        } else {
+            setkilled(p);
+            trap_and_emulate_init();
+        }
+    } 
+    else if(funct3 == 0x1) {
+        // CSRW
+        printf("CSRW (PI at %p) op = %x, rd = %x, funct3 = %x, rs1 = %x, uimm = %x\n", 
+                addr, op, rd, funct3, rs1, uimm);
+        struct vm_reg vr = find_reg(uimm);
+        if(vr.val == -1){
+            printf("Invalid Instruction");
+            return;
+        }
+        if(vm_state.curr_mode >= vr.mode){
+            uint64* rs1_p = &(p->trapframe->ra) + rs1 - 1;
+            vr.val = *rs1_p;
+        } else{
+            setkilled(p);
+            trap_and_emulate_init();
+        }
+        p->trapframe->epc += 4;
+    } 
+    else if (funct3 == 0x2) {
+        // CSRR
+        printf("CSRR (PI at %p) op = %x, rd = %x, funct3 = %x, rs1 = %x, uimm = %x\n", 
+                addr, op, rd, funct3, rs1, uimm);
+        struct vm_reg vr = find_reg(uimm);
+        if(vr.val == -1) {
+            printf("Invalid Instruction");
+            return;
+        }
+        if(vm_state.curr_mode >= vr.mode){
+            uint32 reg_val = vr.val;
+            uint64* rd_p = &(p->trapframe->ra) + rd - 1;
+            *rd_p = reg_val;  
+        } else {
+            setkilled(p);
+            trap_and_emulate_init();
+        }
+        p->trapframe->epc += 4;
+    } 
+    else {
+        printf("ERROR: Incorrect instruction");
+        setkilled(p);
+        trap_and_emulate_init();
+    }
+
+    kfree(pa);
 }
 
 void trap_and_emulate_init(void) {
@@ -167,7 +339,7 @@ void trap_and_emulate_init(void) {
 
     vm_state.mvendorid.code = 0xf11;
     vm_state.mvendorid.mode = 2;
-    vm_state.mvendorid.val = 0x637365353336;
+    vm_state.mvendorid.val = 0xc5e536;
 
     vm_state.marchid.code = 0xf12;
     vm_state.marchid.mode = 2;
@@ -240,4 +412,6 @@ void trap_and_emulate_init(void) {
     vm_state.mtval2.code = 0x34b;
     vm_state.mtval2.mode = 2;
     vm_state.mtval2.val = 0;
+
+    vm_state.curr_mode = 2;
 }

@@ -50,7 +50,16 @@ usertrap(void)
   // save user program counter.
   p->trapframe->epc = r_sepc();
 
-  if(r_scause() == 8){
+  if(strncmp(p->name, "vm-", 3) == 0 && (r_scause() == 2 || r_scause() == 1)){
+    trap_and_emulate();
+  }
+
+  else if(r_scause() == 8){
+    if (strncmp(p->name, "vm-", 3) == 0) {
+      p->proc_te_vm = 1;
+      trap_and_emulate();
+    }
+
     // system call
     if(killed(p))
       exit(-1);
